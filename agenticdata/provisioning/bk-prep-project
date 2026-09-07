@@ -1,0 +1,301 @@
+#!/bin/bash
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# One-time, per-project prep for the agenticdata stream: everything
+# project-bound that participants must not spend event time (or IAM/API
+# propagation waits) on -- APIs, the Datastream service agent, the
+# participant's roles, the Lab 4 data-quality service account, and the
+# network path. The desired state is Terraform (see terraform/), applied
+# with a per-project GCS backend: gs://<project>-tfstate, living in the
+# participant project itself and created here on first run. There is
+# deliberately NO central state anywhere.
+#
+# Callers, all through this one interface:
+#   * single project:  bk-prep-project PROJECT_ID USERNAME
+#   * organizers:      content/agenticdata/provisioning/bk-prep-fleet runs it for
+#                      every CSV row (in parallel), days before the event
+#   * Argolis/self-run: Lab 1 has the participant run it without arguments --
+#                      PROJECT_ID/GCP_USERNAME come from the bootkon
+#                      environment (terraform self-installs when missing)
+#   * Cloud Build:     content/agenticdata/cloudbuild.yaml wraps this script;
+#                      the accounts fork submits one build per project
+#
+# Safe to re-run any time (idempotent apply). Parallel runs for DIFFERENT
+# projects are safe: each gets its own TF_DATA_DIR and its own state bucket.
+# Force semantics built in: same-named resources that exist OUTSIDE the
+# state (old gcloud-flow preps, half-built projects) are adopted via
+# terraform import on conflict and then converged to the config; stale
+# state locks from killed runs are broken automatically.
+# `--destroy` (first argument) tears the prepared resources down again --
+# terraform-only, so it needs an intact state and leaves anything the LABS
+# created untouched; `bk-reset-project` is the state-independent full wipe.
+
+set -u
+
+# --destroy tears down everything this script created (for resetting test
+# projects; event sandboxes are deleted whole and never need it). APIs stay
+# enabled (disable_on_destroy=false) and the state bucket survives.
+MODE=apply
+if [ "${1:-}" = "--destroy" ]; then
+    MODE=destroy
+    shift
+fi
+
+# Arguments work in either order: the one containing @ is the username, the
+# other the project id (fixes the swapped-arguments trap vs. the accounts
+# script). Whatever is missing falls back to the bootkon environment.
+PROJECT=""
+ACCOUNT=""
+for arg in "${1:-}" "${2:-}"; do
+    [ -z "$arg" ] && continue
+    if [[ "$arg" == *@* ]]; then ACCOUNT="$arg"; else PROJECT="$arg"; fi
+done
+PROJECT="${PROJECT:-${PROJECT_ID:-}}"
+ACCOUNT="${ACCOUNT:-${GCP_USERNAME:-}}"
+if [ -z "$PROJECT" ] || [ -z "$ACCOUNT" ]; then
+    echo "Usage: $(basename "$0") [--destroy] [PROJECT_ID] [USERNAME]" >&2
+    echo "(arguments accepted in any order; whatever is missing comes from the" >&2
+    echo " bootkon environment: PROJECT_ID/GCP_USERNAME -- run '. bk' first)" >&2
+    exit 1
+fi
+REGION="${REGION:-us-central1}"
+
+TF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/terraform"
+
+# Terraform availability + version pin live in the shared ensure-terraform
+# helper (sourced, so it can extend PATH); bk-prep-fleet sources the same
+# file before its local fan-out.
+. "$(dirname "${BASH_SOURCE[0]}")/ensure-terraform" || exit 1
+
+# Per-project state bucket, inside the project it describes -- the state
+# dies with the sandbox, and no cross-project access is ever needed.
+BUCKET="${PROJECT}-tfstate"
+if [ "$MODE" = "destroy" ]; then
+    echo "Destroying the prepared resources in project $PROJECT ..."
+    if ! gcloud storage buckets describe "gs://$BUCKET" --project="$PROJECT" >/dev/null 2>&1; then
+        echo "No state bucket gs://$BUCKET -- nothing this script created to destroy."
+        exit 0
+    fi
+else
+    echo "Preparing project $PROJECT for $ACCOUNT ..."
+    if ! gcloud storage buckets describe "gs://$BUCKET" --project="$PROJECT" >/dev/null 2>&1; then
+        echo "Creating the state bucket gs://$BUCKET ..."
+        gcloud storage buckets create "gs://$BUCKET" --project="$PROJECT" \
+            --location="$REGION" --uniform-bucket-level-access \
+            || { echo "ERROR: creating the state bucket failed." >&2; exit 1; }
+    fi
+fi
+
+# Terraform's engine needs these two meta-APIs before it can even plan --
+# data.google_project and the IAM writes go through Cloud Resource Manager,
+# which is DISABLED on a fresh project, and terraform cannot enable the API
+# it needs to talk (seen live: "Cloud Resource Manager API has not been used
+# in project ... before or it is disabled"). gcloud can: it goes through
+# Service Usage, which is on by default. Every other API is then enabled BY
+# terraform. The enable also gets propagation time while init downloads the
+# providers.
+echo "Enabling the Resource Manager / Service Usage APIs ..."
+gcloud services enable cloudresourcemanager.googleapis.com serviceusage.googleapis.com \
+    --project="$PROJECT" \
+    || { echo "ERROR: enabling the bootstrap APIs failed." >&2; exit 1; }
+
+# Isolate parallel runs: each project gets its own working dir; the provider
+# plugin cache is shared (the organizer loop warms it with a serial first
+# run before fanning out).
+export TF_IN_AUTOMATION=1
+export TF_DATA_DIR="${TMPDIR:-/tmp}/bootkon-tf/${PROJECT}"
+export TF_PLUGIN_CACHE_DIR="${TMPDIR:-/tmp}/bootkon-tf/plugin-cache"
+mkdir -p "$TF_DATA_DIR" "$TF_PLUGIN_CACHE_DIR"
+
+terraform -chdir="$TF_DIR" init -input=false -reconfigure \
+    -backend-config="bucket=$BUCKET" -backend-config="prefix=bootkon-prep" >/dev/null \
+    || { echo "ERROR: terraform init for $PROJECT failed." >&2; exit 1; }
+
+# The apply output is captured (across the retry too) to detect whether THIS
+# run freshly created the SQL instance -- only then is it parked below.
+APPLY_LOG="$TF_DATA_DIR/last-apply.log"
+: > "$APPLY_LOG"
+# -lock-timeout waits out a still-active concurrent run; a lock that stays is
+# stale (Ctrl-C'd laptop run, killed build) and gets broken below -- safe,
+# because the model is strictly one runner per project.
+tf_apply() {
+    terraform -chdir="$TF_DIR" "$1" -input=false -auto-approve -lock-timeout=120s \
+        -var "project_id=$PROJECT" -var "username=$ACCOUNT" -var "region=$REGION" \
+        2>&1 | tee -a "$APPLY_LOG"
+    return "${PIPESTATUS[0]}"
+}
+# Run apply/destroy; on a lock failure, tell an ACTIVE run apart from a
+# STALE lock. Breaking the lock is only safe when the holder is dead -- a
+# second prep started against the same project must back off instead of
+# sabotaging the first (a lock younger than the 60-minute build timeout
+# means someone is genuinely working).
+tf_run() {
+    tf_apply "$1" && return 0
+    if grep -q "Error acquiring the state lock" "$APPLY_LOG"; then
+        local lock_age
+        lock_age="$(lock_age_seconds)"
+        if [ -n "$lock_age" ] && [ "$lock_age" -lt 3600 ]; then
+            echo "ERROR: another prep is ALREADY RUNNING against $PROJECT (state lock" >&2
+            echo "held for ${lock_age}s). Not interfering -- check progress with" >&2
+            echo "bk-verify-fleet; a dead run's lock self-heals after an hour." >&2
+            return 1
+        fi
+        local lock_id
+        lock_id=$(grep -oE 'ID:[[:space:]]*[0-9]+' "$APPLY_LOG" | tail -1 | grep -oE '[0-9]+')
+        if [ -n "$lock_id" ]; then
+            echo "Breaking a stale terraform state lock ($lock_id, age ${lock_age:-unknown}s) and retrying ..."
+            terraform -chdir="$TF_DIR" force-unlock -force "$lock_id" >/dev/null 2>&1 || true
+            tf_apply "$1" && return 0
+        fi
+    fi
+    return 1
+}
+
+# Age of the GCS state lock object in seconds (empty if unreadable).
+lock_age_seconds() {
+    local created
+    created="$(gcloud storage objects describe "gs://$BUCKET/bootkon-prep/default.tflock" \
+        --format='value(timeCreated)' 2>/dev/null)"
+    [ -z "$created" ] && return 0
+    python3 -c "import sys,datetime; t=datetime.datetime.fromisoformat(sys.argv[1].replace('Z','+00:00')); print(int((datetime.datetime.now(datetime.timezone.utc)-t).total_seconds()))" "$created" 2>/dev/null
+}
+
+# Import one resource into the state if it is not there yet; a missing remote
+# object just means apply will create it -- both outcomes are fine.
+adopt() {
+    terraform -chdir="$TF_DIR" state list 2>/dev/null | grep -qxF "$1" && return 0
+    terraform -chdir="$TF_DIR" import -input=false -lock-timeout=120s \
+        -var "project_id=$PROJECT" -var "username=$ACCOUNT" -var "region=$REGION" \
+        "$1" "$2" >/dev/null 2>&1 || true
+}
+
+# Force-adopt everything this config manages that may already exist outside
+# the state -- e.g. a project prepped by the old gcloud flow. After the
+# imports, the re-apply converges the adopted resources to the config
+# (updating in place, or replacing where attributes force it). IAM members,
+# API enablements and the service identity never 409 and need no import.
+adopt_existing() {
+    echo "Adopting pre-existing resources into the terraform state ..."
+    adopt google_compute_network.vpc "projects/$PROJECT/global/networks/cymbal-vpc"
+    adopt google_compute_subnetwork.subnet "projects/$PROJECT/regions/$REGION/subnetworks/cymbal-subnet"
+    adopt google_compute_address.endpoint_ip "projects/$PROJECT/regions/$REGION/addresses/cymbal-endpoint-ip"
+    adopt google_compute_network_attachment.attachment "projects/$PROJECT/regions/$REGION/networkAttachments/cymbal-attachment"
+    adopt google_datastream_private_connection.psc "projects/$PROJECT/locations/$REGION/privateConnections/cymbal-psc"
+    adopt google_compute_firewall.allow_iap_ingress "projects/$PROJECT/global/firewalls/allow-iap-ingress"
+    adopt google_compute_instance.jump "projects/$PROJECT/zones/${REGION}-a/instances/cymbal-jump"
+    adopt google_sql_database_instance.oltp "projects/$PROJECT/instances/cymbal-oltp"
+    adopt google_sql_database.cymbal "projects/$PROJECT/instances/cymbal-oltp/databases/cymbal"
+    adopt google_compute_forwarding_rule.endpoint "projects/$PROJECT/regions/$REGION/forwardingRules/cymbal-endpoint"
+    adopt google_service_account.dataquality "projects/$PROJECT/serviceAccounts/dataquality-service-account@${PROJECT}.iam.gserviceaccount.com"
+    adopt google_bigquery_dataset.bronze "projects/$PROJECT/datasets/cymbal_bronze"
+    adopt google_datastream_connection_profile.bq "projects/$PROJECT/locations/$REGION/connectionProfiles/cymbal-bq-profile"
+    adopt google_storage_bucket.seed "$PROJECT/${PROJECT}-bucket"
+}
+
+if [ "$MODE" = "destroy" ]; then
+    if tf_run destroy; then
+        echo "Project $PROJECT: prepared resources destroyed in $((SECONDS/60))m$((SECONDS%60))s"
+        echo "(APIs stay enabled; the state bucket gs://$BUCKET remains)."
+        exit 0
+    else
+        echo "ERROR: terraform destroy for $PROJECT failed -- see above. Typical" >&2
+        echo "cause: lab-created resources still hold the prepped ones (e.g. a" >&2
+        echo "Datastream stream and its connection profiles on the private" >&2
+        echo "connection). Delete those first, then re-run with --destroy." >&2
+        exit 1
+    fi
+fi
+
+# If the instance exists but is parked (NEVER), Terraform will fail to adopt
+# or create the database (Error 400: Invalid request since instance is not running).
+# Wake it up silently here before apply. We'll park it again at the end if we seeded it
+# or woke it up here.
+BK_WOKE_INSTANCE=0
+if gcloud sql instances describe cymbal-oltp --project="$PROJECT" --format="value(settings.activationPolicy)" 2>/dev/null | grep -q "NEVER"; then
+    echo "Instance is parked; waking it up for terraform operations ..."
+    gcloud sql instances patch cymbal-oltp --activation-policy=ALWAYS --project="$PROJECT" --quiet >/dev/null 2>&1 || true
+    BK_WOKE_INSTANCE=1
+fi
+
+if ! tf_run apply; then
+    APPLY_OK=""
+
+    # Recovery 1 -- pre-existing resources (409 already exists): a project
+    # prepped by the old gcloud flow (or half-built otherwise) has the
+    # resources in the cloud but not in the state. Adopt them and apply
+    # again; terraform then converges them to the config.
+    if grep -qiE "already exists|alreadyExists" "$APPLY_LOG"; then
+        adopt_existing
+        tf_run apply && APPLY_OK=1
+    fi
+
+    # Recovery 2 -- the known flaky failure: the Datastream private
+    # connection loses the IAM propagation race despite the time_sleep
+    # buffer and ends up FAILED ("Failed to create PrivateConnection. An
+    # unknown error occurred"). The proven remedy is delete + retry: by now
+    # the role has long propagated, and the retry reliably succeeds (the
+    # time_sleep is already in the state, so the next apply goes straight
+    # to the create).
+    if [ -z "$APPLY_OK" ]; then
+        psc_state="$(gcloud datastream private-connections describe cymbal-psc \
+            --location="$REGION" --project="$PROJECT" --format='value(state)' 2>/dev/null || true)"
+        if [ "$psc_state" = "FAILED" ] || [ "$psc_state" = "FAILED_TO_DELETE" ]; then
+            echo "Private connection ended $psc_state (IAM propagation race) -- deleting it and retrying once ..."
+            gcloud datastream private-connections delete cymbal-psc \
+                --location="$REGION" --project="$PROJECT" --quiet || true
+            # Deletion is asynchronous; wait until it is really gone,
+            # otherwise the re-create collides with the name.
+            while gcloud datastream private-connections describe cymbal-psc \
+                --location="$REGION" --project="$PROJECT" >/dev/null 2>&1; do
+                sleep 10
+            done
+            tf_run apply && APPLY_OK=1
+        fi
+    fi
+
+    if [ -z "$APPLY_OK" ]; then
+        echo "ERROR: terraform apply for $PROJECT failed -- see above. Re-running is safe." >&2
+        exit 1
+    fi
+fi
+
+# Generate, stage and import Cymbal's history -- at prep time, so Lab 2 opens
+# on a database that already holds it. Must run BEFORE the parking below: the
+# instance has to be RUNNABLE for the Admin API imports. Re-run safety and
+# resume-after-failure live in the seed script's per-object markers.
+SEED="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/bk-seed-project"
+export BK_SEED_STAMP="$TF_DATA_DIR/seeded-this-run"
+rm -f "$BK_SEED_STAMP"
+"$SEED" "$PROJECT" || { echo "ERROR: seeding $PROJECT failed -- see above. Re-running is safe." >&2; exit 1; }
+
+# Park a FRESHLY built instance (the API refuses to create one stopped):
+# storage-only cost (~$0.06/day instead of ~$1.70/day) until the participant
+# runs `. bk`, whose bk-init wakes the instance in the background -- by the
+# time they reach Lab 1's take-ownership step it is up, and Lab 1 carries a
+# visible backup start for the rare case the silent wake failed. Gated on
+# this run's apply output, so a re-prep never stops a participant's
+# already-woken instance.
+# Parking applies to an instance this run built or seeded -- both are
+# prep-time states. (Seeding only happens once, so a re-prep during the event
+# never parks an instance a participant has woken.)
+if grep -q "google_sql_database_instance.oltp: Creation complete" "$APPLY_LOG" \
+    || [ -f "$BK_SEED_STAMP" ] || [ "${BK_WOKE_INSTANCE:-0}" = "1" ]; then
+    echo "Parking cymbal-oltp (stopped until the participant's setup wakes it) ..."
+    gcloud sql instances patch cymbal-oltp --activation-policy=NEVER \
+        --project="$PROJECT" --quiet >/dev/null 2>&1 \
+        || echo "WARNING: could not park cymbal-oltp -- it stays running (~\$1.70/day)." >&2
+fi
+
+echo "Project $PROJECT prepared in $((SECONDS/60))m$((SECONDS%60))s."

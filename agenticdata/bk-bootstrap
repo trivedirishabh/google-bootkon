@@ -1,0 +1,148 @@
+#!/bin/bash
+# Bootstraps the Agentic Data Bootkon stream on PARTICIPANT time: Python
+# deps, the Dataform CLI and its project wiring, and the agy
+# pre-configuration.
+#
+# Everything project-bound (APIs, the Datastream service agent, the
+# participant's roles, the Lab 4 data-quality service account) lives in
+# content/agenticdata/provisioning/bk-prep-project, which the ORGANIZER runs for every
+# project days ahead (via content/agenticdata/provisioning/bk-prep-fleet) -- so
+# no IAM/API propagation race can reach a participant, and this script needs
+# no setIamPolicy. On Argolis/self-run, Lab 1 has the participant run
+# bk-prep-project themselves, right before this script. The tutorial's
+# enable-apis step stays as a green no-op verification.
+#
+# It creates NO cloud infrastructure at all -- networking, Cloud SQL and the
+# Datastream private connection live in provisioning/terraform. (The old
+# option1-vpc-peering-proxy.diff predates that split and no longer applies.)
+#
+# Error handling: every step is checked and counted. The script keeps going
+# so one flaky call does not abort the remaining setup, but it only
+# claims success when NOTHING failed.
+
+# PROJECT_NUMBER is set by `. bk` only after successful project validation --
+# and it is exactly what the service-agent emails below are built from.
+[[ -z "$PROJECT_NUMBER" ]] && echo "Bootkon has not been initialized. Please follow the tutorial and run '. bk'" && exit 1
+
+# Pin gcloud to the persisted project for every command below: Cloud Shell
+# ties the gcloud config to the project picker and may leave it unset ("The
+# required property [project] is not currently set"), while PROJECT_ID from
+# vars.local.sh is always there. The env var takes priority over the config.
+export CLOUDSDK_CORE_PROJECT="${PROJECT_ID:?PROJECT_ID is not set. Run '. bk' or open a new terminal.}"
+
+# The lab invokes this script by relative path from the repo root, but a fresh
+# tab starts in $HOME -- pin the cwd so the relative paths below always work.
+cd "$BK_DIR" || { echo "ERROR: could not enter $BK_DIR -- please run '. bk' first." >&2; exit 1; }
+
+FAILURES=0
+step_failed() {
+    FAILURES=$((FAILURES + 1))
+    echo "ERROR: $1 -- see the message above." >&2
+}
+
+# Quiet pip: --no-warn-conflicts silences the scary resolver-conflict block
+# (pre-installed Cloud Shell packages conflict outside our pinned closure --
+# harmless, but it reads like an error and reliably generated "is this ok?"
+# questions), --disable-pip-version-check drops the new-pip-release nag, and
+# -q hides the requirement-already-satisfied noise on re-runs. Real install
+# failures still print.
+echo "Installing the Python dependencies ..."
+pip install -q --no-warn-conflicts --disable-pip-version-check \
+    -r content/agenticdata/requirements.txt \
+    || step_failed "installing the Python dependencies (pip) failed"
+
+# The Dataform CLI for Lab 3 (open-source npm package; pinned to the major
+# the labs are written against). npm blocks dependency lifecycle scripts by
+# default nowadays; protobufjs (a @dataform/cli dependency) needs its
+# postinstall, so allow exactly that one (verified live). loglevel=error
+# keeps npm's funding/audit chatter out of the bootstrap output; real
+# failures still print.
+echo "Installing the Dataform CLI ..."
+if ! command -v npm >/dev/null 2>&1; then
+    [ -s "${NVM_DIR:-}/nvm.sh" ] && \. "$NVM_DIR/nvm.sh" 2>/dev/null || true
+    [ -s "$HOME/.nvm/nvm.sh" ] && \. "$HOME/.nvm/nvm.sh" 2>/dev/null || true
+fi
+npm config set allow-scripts=protobufjs --location=user \
+    || step_failed "configuring npm (allow-scripts) failed"
+npm install -g @dataform/cli@3 --no-fund --no-audit --loglevel=error \
+    || step_failed "installing the Dataform CLI (npm) failed"
+
+# Pre-wire Lab 3's Dataform project: render workflow_settings.yaml from the
+# committed template (both the rendered file and the credentials are
+# git-ignored, so the checkout stays clean and mid-event content fixes can
+# still fast-forward pull) -- the lab then starts at the authoring, not at
+# plumbing. Overwriting on re-runs is deliberate: it heals a broken edit.
+echo "Configuring the Dataform project ..."
+sed "s/PROJECT_ID_PLACEHOLDER/${PROJECT_ID}/" \
+    content/agenticdata/src/dataform/workflow_settings.template.yaml \
+    > content/agenticdata/src/dataform/workflow_settings.yaml \
+    || step_failed "writing workflow_settings.yaml failed"
+echo "{\"projectId\": \"${PROJECT_ID}\", \"location\": \"US\"}" > content/agenticdata/src/dataform/.df-credentials.json \
+    || step_failed "writing the Dataform credentials file failed"
+
+# NOTE: the seed data is NOT generated here anymore -- provisioning
+# generates it, stages it in the bucket and imports it into Cloud SQL, so
+# Lab 2 starts on a database that already holds Cymbal's history.
+
+# NOTE: the stream's secrets (BK_DB_PASSWORD/BK_DS_PASSWORD) and runtime config
+# are NOT written here -- they are created by content/agenticdata/provisioning/bk-init, which
+# `. bk` runs at initialization, before the first tutorial render. This script
+# keeps only the per-user work: pip, the Dataform CLI, agy.
+
+# Pre-configure Antigravity CLI (agy). It is already installed in Cloud Shell.
+# Every key below mirrors OBSERVED persisted state (2026-08-13, diffed from
+# a logged-in devstar home) -- documentation-guessed keys kept turning out
+# to be dead config that agy drops on its next settings rewrite (RIP
+# toolPermission). The gcp block does NOT skip the sign-in dialog (tested:
+# the menu hangs off the missing per-account OAuth token), but it pre-fills
+# project/location; Lab 1 walks through the dialog. permissions.allow uses
+# the command(...) entries agy itself writes on "always allow": pre-approve
+# the everyday commands the lab /goals need (exploration + dataform compile
+# + python checks), so authoring flows without a prompt per command --
+# while gcloud/bq/psql are deliberately NOT listed: anything touching cloud
+# resources still asks first, which is exactly the Lab 10 co-responder
+# pattern.
+AGY_DIR=~/.gemini/antigravity-cli
+if [ ! -f "$AGY_DIR/settings.json" ]; then
+    echo "Pre-configuring Antigravity CLI (agy) ..."
+    mkdir -p "$AGY_DIR"
+    cat > "$AGY_DIR/settings.json" <<JSON
+{
+  "enableTelemetry": false,
+  "gcp": {
+    "project": "$PROJECT_ID",
+    "location": "global"
+  },
+  "permissions": {
+    "allow": [
+      "command(ls)",
+      "command(cat)",
+      "command(head)",
+      "command(tail)",
+      "command(grep)",
+      "command(find)",
+      "command(dataform)",
+      "command(python3)"
+    ]
+  },
+  "trustedWorkspaces": [
+    "$BK_DIR",
+    "$BK_DIR/content/agenticdata/src/dataform",
+    "$BK_DIR/content/agenticdata/src/adk"
+  ],
+  "allowNonWorkspaceAccess": true
+}
+JSON
+else
+    echo "agy settings.json already exists; leaving it untouched."
+fi
+
+echo
+if [ "$FAILURES" -eq 0 ]; then
+    echo "Bootstrap complete."
+else
+    echo "Bootstrap finished with $FAILURES error(s) -- scroll up for the details," >&2
+    echo "then run this script again (it is safe to re-run). If it keeps failing," >&2
+    echo "ask the event staff." >&2
+    exit 1
+fi

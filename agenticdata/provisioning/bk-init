@@ -1,0 +1,83 @@
+#!/bin/bash
+# Stream init hook for agenticdata, run by `. bk` on every initialization and
+# reload -- AFTER project validation and BEFORE the first tutorial render, so
+# everything written here is already available when the labs are rendered.
+#
+# Contract (see .scripts/bk): idempotent, local-only, instant. Secrets are
+# written once (--if-empty); deterministic runtime config is upserted. Heavy,
+# visible GCP work (APIs, IAM, service accounts, pip) lives in bk-bootstrap,
+# which participants run in Lab 1. One sanctioned exception below: a silent,
+# backgrounded one-time prep of the Datastream service agent, which costs the
+# caller nothing and buys IAM propagation a long head start.
+
+set -eu
+
+LOCAL="$BK_DIR/vars.local.sh"
+SET_VAR="$BK_DIR/.scripts/bk-set-var"
+
+# One-time, fire-and-forget: prepare the Datastream service agent at setup
+# time. bk-prep-project (organizer-run for events, participant-run on
+# Argolis in Lab 1) is the real owner of this nowadays -- including the
+# private-connection build itself -- so this is a harmless extra head start
+# for the IAM propagation, kept because it costs nothing. Backgrounded and
+# silent to keep `. bk` instant (contract above), guarded to run once per
+# project.
+if [ "${BK_DS_AGENT_PREP:-}" != "$PROJECT_ID" ]; then
+    "$SET_VAR" --comment "Internal: project the background Datastream agent prep ran for" "$LOCAL" BK_DS_AGENT_PREP "$PROJECT_ID"
+    (
+        gcloud services enable datastream.googleapis.com dataplex.googleapis.com >/dev/null 2>&1 &&
+        gcloud beta services identity create --service=datastream.googleapis.com \
+            --project="$PROJECT_ID" --quiet >/dev/null 2>&1 &&
+        gcloud beta services identity create --service=dataplex.googleapis.com \
+            --project="$PROJECT_ID" --quiet >/dev/null 2>&1 &&
+        gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+            --member="serviceAccount:service-${PROJECT_NUMBER}@gcp-sa-datastream.iam.gserviceaccount.com" \
+            --role="roles/datastream.serviceAgent" --condition=None >/dev/null 2>&1
+    ) &
+fi
+
+# One-time, fire-and-forget: wake the pre-provisioned Cloud SQL instance.
+# bk-prep-project parks it stopped after building it (storage-only cost
+# until the event); starting takes 1-2 minutes, so kick it off HERE in the
+# background, at the participant's very first `. bk` -- it overlaps with the
+# onboarding and the Lab 1 bootstrap, and by the take-ownership step the
+# instance is up. Lab 1 carries a visible backup start for the rare case
+# this silent wake failed. On self-run/Argolis (instance not parked or not
+# created yet) the patch is a harmless no-op or silent failure.
+if [ "${BK_SQL_WOKEN:-}" != "$PROJECT_ID" ]; then
+    "$SET_VAR" --comment "Internal: project whose cymbal-oltp was woken at setup" "$LOCAL" BK_SQL_WOKEN "$PROJECT_ID"
+    (gcloud sql instances patch cymbal-oltp --activation-policy=ALWAYS \
+        --project="$PROJECT_ID" --quiet >/dev/null 2>&1) &
+fi
+
+# Fire-and-forget: bring up the IAP tunnel that makes localhost:5432 the
+# Cymbal database. Unlike the two blocks above this is deliberately NOT
+# marker-guarded -- a tunnel is a process, and a recycled Cloud Shell VM
+# kills it, so every `. bk` must be able to bring it back. The guard is the
+# port itself: if anything already listens on 5432 (including a participant
+# running bk-tunnel in a terminal), leave it alone. Output goes to a log,
+# because a background tunnel that dies must stay diagnosable; bk-tunnel
+# gives up by itself when the VM or the authorization is missing, so this
+# never becomes an endless retry loop. On Argolis the jump VM only exists
+# after Lab 1's prep -- the labs name `bk-tunnel` as the recovery.
+if ! (echo >/dev/tcp/localhost/5432) 2>/dev/null; then
+    nohup "$BK_DIR/content/agenticdata/bk-tunnel" \
+        >> "$HOME/.bootkon-tunnel.log" 2>&1 &
+    disown 2>/dev/null || true
+fi
+
+# Generated once: Lab 1 sets BK_DB_PASSWORD as the postgres password on the
+# pre-provisioned Cloud SQL instance; Lab 2 creates the Datastream connection
+# profile with BK_DS_PASSWORD.
+"$SET_VAR" --if-empty --comment "Cloud SQL (Postgres) root password -- generated once" "$LOCAL" BK_DB_PASSWORD "$(openssl rand -hex 16)"
+"$SET_VAR" --if-empty --comment "Datastream connection password -- generated once" "$LOCAL" BK_DS_PASSWORD "$(openssl rand -hex 16)"
+
+# Deterministic runtime config for the ADK / Antigravity (agy) tooling.
+# GOOGLE_CLOUD_PROJECT is intentionally NOT set: Cloud Shell already exports it
+# (= the active project = PROJECT_ID); bootkon's own code uses PROJECT_ID.
+"$SET_VAR" --comment "Route google-genai through Vertex AI" "$LOCAL" GOOGLE_GENAI_USE_VERTEXAI TRUE
+"$SET_VAR" --comment "Location for the GenAI/Vertex client" "$LOCAL" GOOGLE_CLOUD_LOCATION global
+"$SET_VAR" --comment "Gemini model id used by the Cymbal agents" "$LOCAL" BK_CYMBAL_MODEL gemini-2.5-flash
+"$SET_VAR" --comment "Conversational Analytics data agent id" "$LOCAL" BK_DATA_AGENT_ID cymbal-data-agent
+"$SET_VAR" --comment "Cymbal DB host (reached via the bk-tunnel)" "$LOCAL" BK_CYMBAL_DB_HOST localhost
+"$SET_VAR" --comment "Cymbal DB port (reached via the bk-tunnel)" "$LOCAL" BK_CYMBAL_DB_PORT 5432

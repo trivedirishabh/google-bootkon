@@ -1,0 +1,15 @@
+# Pinned for reproducibility across ~100 identical sandbox environments.
+# Re-verify every pin during the smoke test (CONCEPT.md, section 12) --
+# google-adk and google-cloud-geminidataanalytics move fast.
+faker==37.4.0
+psycopg[binary]==3.2.13
+google-adk[a2a]==2.3.0
+# google-adk[a2a] does NOT pull the http-server extras that to_a2a() needs
+# at runtime (starlette/sse-starlette) -- verified live in the smoke test.
+a2a-sdk[http-server]==0.3.26
+google-cloud-geminidataanalytics==0.13.1
+# gcloud's IAP tunnel (bk-tunnel, open all event) nags "consider installing
+# NumPy" on every start and transfers faster with it -- install it once here.
+# (2.2.x on purpose: newest series to still support Python 3.10-3.13, so the
+# pin works regardless of the Cloud Shell image's python3.)
+numpy==2.2.6

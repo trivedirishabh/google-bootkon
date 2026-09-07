@@ -1,0 +1,390 @@
+#!/bin/bash
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Organizer-side fleet prep for the AGENTICDATA stream: preps every
+# participant project from the accounts CSV (username in the first column;
+# project = PREFIX + numeric suffix of the username -- the same contract as
+# the other streams' bk-bootstrap-accounts).
+#
+# For every CSV row it runs content/agenticdata/bk-prep-project (the single
+# per-project entry point, Terraform-backed with per-project state), IN
+# PARALLEL: the first project runs alone to warm the Terraform plugin cache,
+# then BK_PREP_PARALLEL workers (default 8) fan out over the rest. Per-
+# project output goes to a log directory; the console shows one line per
+# project plus a red/green summary. Run it DAYS before the event and no
+# IAM/API propagation race can ever reach a participant.
+#
+# Rerun-safe: re-running preps only what is missing (idempotent applies).
+
+# --cloud-build: instead of running the preps locally (xargs), submit ONE
+# Cloud Build per participant project (cloudbuild.yaml wraps the very same
+# bk-prep-project) and return -- the builds run server-side inside the
+# projects as their bootkon-provisioner service account; progress and
+# readiness are bk-verify-fleet's job.
+# Flags are accepted at any position; unknown flags are hard errors -- a
+# silently ignored --cloud-build once sent a run down the local path.
+MODE=cloudbuild
+AUTO_CONFIRM=0
+POSITIONAL=()
+for arg in "$@"; do
+    case "$arg" in
+        --local) MODE=local ;;
+        --cloud-build) MODE=cloudbuild ;;
+        -y|--yes) AUTO_CONFIRM=1 ;;
+        --*) echo "Error: unknown flag '$arg'." >&2; exit 1 ;;
+        *) POSITIONAL+=("${arg}") ;;
+    esac
+done
+LOCAL_CSV_FILE="${POSITIONAL[0]:-}"
+PROJECT_ID_PREFIX="${POSITIONAL[1]:-}"
+if [ ${#POSITIONAL[@]} -gt 2 ]; then
+    echo "Error: unexpected extra argument '${POSITIONAL[2]}'." >&2
+    exit 1
+fi
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+NC='\033[0m'
+
+if [[ -z "$LOCAL_CSV_FILE" ]]; then
+    echo "Error: Missing required arguments."
+    echo "Usage: $(basename $0) [--local] [-y] <CSV_FILE|USERNAME> [PROJECT_ID_PREFIX]"
+    echo "Examples:"
+    echo "  $(basename $0) \"Bootkon Test Accounts - Sheet1.csv\""
+    echo "  $(basename $0) devstar1234@gcplab.me \"bootkon-dt25test-\""
+    echo "  $(basename $0) --local \"Bootkon Test Accounts - Sheet1.csv\"   # run locally via xargs"
+    echo ""
+    echo "Without a prefix the projects are looked up by the username's number."
+    echo "Default mode: Cloud Build (submits server-side builds for all projects)."
+    echo "Pass --local to run preps directly on this machine (BK_PREP_PARALLEL=<n>, default 8)."
+    exit 1
+fi
+
+# Isolate gcloud configuration to prevent mTLS / Context-Aware Access certificate
+# collisions (caa_cert.pem race condition) on corp machines.
+SRC_CONFIG="${CLOUDSDK_CONFIG:-$HOME/.config/gcloud}"
+MAIN_GCLOUD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/bk-gcloud.XXXXXX")"
+trap 'rm -rf "$MAIN_GCLOUD_DIR" "${LOG_DIR:-}"' EXIT
+if [ -d "$SRC_CONFIG" ]; then
+    for f in "$SRC_CONFIG"/*; do
+        [ -e "$f" ] || continue
+        b="${f##*/}"
+        case "$b" in
+            caa_cert.pem|logs) continue ;;
+            *) ln -s "$f" "$MAIN_GCLOUD_DIR/$b" 2>/dev/null || true ;;
+        esac
+    done
+fi
+export CLOUDSDK_CONFIG="$MAIN_GCLOUD_DIR"
+
+CALLER="$(gcloud config get-value account 2>/dev/null)"
+if [ -z "$CALLER" ] || [ "$CALLER" = "(unset)" ]; then
+    echo -e "${RED}Error: No active gcloud account set on this machine. Run 'gcloud auth login' first.${NC}" >&2
+    exit 1
+fi
+
+AUTH_ERR="$(mktemp "${TMPDIR:-/tmp}/bk-auth-err.XXXXXX")"
+if ! gcloud auth print-access-token >/dev/null 2>"$AUTH_ERR"; then
+    echo -e "${RED}Error: gcloud authentication failed for $CALLER:${NC}" >&2
+    cat "$AUTH_ERR" >&2
+    rm -f "$AUTH_ERR"
+    echo -e "${RED}Run 'gcloud auth login' first.${NC}" >&2
+    exit 1
+fi
+rm -f "$AUTH_ERR"
+
+if [ "$MODE" = "cloudbuild" ]; then
+    echo "Mode: Cloud Build (one build per project; default)."
+else
+    echo "Mode: local (the preps run right here on this machine)."
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PREP="$SCRIPT_DIR/bk-prep-project"
+if [ ! -x "$PREP" ]; then
+    echo "Error: $PREP not found or not executable." >&2
+    exit 1
+fi
+
+PARALLEL="${BK_PREP_PARALLEL:-8}"
+LOG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/bk-prep-logs.XXXXXX")"
+
+# Usernames first
+USERS=()
+if [ ! -f "$LOCAL_CSV_FILE" ] && [[ "$LOCAL_CSV_FILE" == *@* ]]; then
+    USERS+=("$LOCAL_CSV_FILE")
+elif [ ! -f "$LOCAL_CSV_FILE" ]; then
+    echo "Error: $LOCAL_CSV_FILE is neither a file nor a username (user@domain)." >&2
+    exit 1
+else
+    while IFS=, read -r -a fields || [ ${#fields[@]} -gt 0 ]; do
+        USERNAME=${fields[0]%$'\r'}
+        [ -z "$USERNAME" ] && continue
+        USERS+=("$USERNAME")
+    done < <(tail -n +2 "$LOCAL_CSV_FILE")
+fi
+
+if [ ${#USERS[@]} -eq 0 ]; then
+    echo "No usernames found in $LOCAL_CSV_FILE."
+    exit 1
+fi
+
+# Project ids are PREFIX + the username's number. Without a prefix, derive
+# it once from the first matching user in the CSV -- all projects in a fleet
+# share the same prefix.
+if [ -z "$PROJECT_ID_PREFIX" ]; then
+    echo "No project prefix given -- deriving it from the projects you can see ..."
+    PROJECTS_ERR="$(mktemp "${TMPDIR:-/tmp}/bk-projects-err.XXXXXX")"
+    if ! ALL_PROJECTS="$(gcloud projects list --format='value(projectId)' 2>"$PROJECTS_ERR")"; then
+        echo -e "${RED}Error: 'gcloud projects list' failed:${NC}" >&2
+        cat "$PROJECTS_ERR" >&2
+        rm -f "$PROJECTS_ERR"
+        exit 1
+    fi
+    rm -f "$PROJECTS_ERR"
+    if [ -z "$ALL_PROJECTS" ]; then
+        echo -e "${RED}Error: could not list any projects for $CALLER -- pass the prefix explicitly.${NC}" >&2
+        exit 1
+    fi
+    for USERNAME in "${USERS[@]}"; do
+        SUFFIX="$(printf '%s' "${USERNAME%%@*}" | grep -o '[0-9]\+' | tail -1)"
+        [ -z "$SUFFIX" ] && continue
+        MATCHES="$(printf '%s\n' "$ALL_PROJECTS" | grep -E -- "([^0-9]|^)${SUFFIX}$" || true)"
+        COUNT="$(printf '%s' "$MATCHES" | grep -c . || true)"
+        if [ "$COUNT" = "1" ]; then
+            PROJECT_ID_PREFIX="${MATCHES%"${SUFFIX}"}"
+            echo "Derived project prefix '$PROJECT_ID_PREFIX' (from $MATCHES for $USERNAME)."
+            break
+        fi
+    done
+    if [ -z "$PROJECT_ID_PREFIX" ]; then
+        echo -e "${RED}Error: could not derive project prefix from any user in $LOCAL_CSV_FILE -- pass the prefix explicitly.${NC}" >&2
+        exit 1
+    fi
+fi
+
+ROWS=()
+RESOLVE_FAILED=0
+for USERNAME in "${USERS[@]}"; do
+    # Digits from the local part only, last group -- a domain like
+    # gcp2lab.me must not end up in the project id.
+    SUFFIX="$(printf '%s' "${USERNAME%%@*}" | grep -o '[0-9]\+' | tail -1)"
+    if [ -z "$SUFFIX" ]; then
+        echo -e "${RED}$USERNAME: no number in the username to build a project id from.${NC}" >&2
+        RESOLVE_FAILED=1
+        continue
+    fi
+    ROWS+=("$USERNAME ${PROJECT_ID_PREFIX}${SUFFIX}")
+done
+
+if [ "$RESOLVE_FAILED" = "1" ] || [ ${#ROWS[@]} -eq 0 ]; then
+    echo "Aborting due to project resolution errors." >&2
+    exit 1
+fi
+
+echo ""
+echo "================================================================================"
+echo "PROVISIONING PLAN SUMMARY"
+echo "================================================================================"
+if [ "$MODE" = "cloudbuild" ]; then
+    echo "  Execution Mode : Cloud Build (submits server-side builds for all projects)"
+else
+    echo "  Execution Mode : Local (runs terraform locally with $PARALLEL workers)"
+fi
+echo "  Project Prefix : ${PROJECT_ID_PREFIX:-[Derived]}"
+echo "  Target Count   : ${#ROWS[@]} project(s)"
+echo ""
+echo "Target Projects & Users:"
+for row in "${ROWS[@]}"; do
+    set -- $row
+    echo "  * $2 ($1)"
+done
+echo "================================================================================"
+echo ""
+
+if [ -t 0 ] && [ "${AUTO_CONFIRM:-0}" != "1" ] && [ "${BK_PREP_AUTO_CONFIRM:-0}" != "1" ]; then
+    echo -n "Press [ENTER] to confirm and start provisioning (or Ctrl+C to cancel)... "
+    read -r _unused
+    echo ""
+fi
+
+if [ "$MODE" = "cloudbuild" ]; then
+    REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+    echo "Preparing ${#ROWS[@]} agenticdata project(s) via Cloud Build (one build each)."
+    echo ""
+
+    # Pass 1: enable Cloud Build and create the owner service account the
+    # build runs as. Deliberately a SEPARATE pass over all rows: by the time
+    # pass 2 submits the builds, the owner grants have had the whole loop to
+    # propagate.
+    SKIP=()
+    for row in "${ROWS[@]}"; do
+        set -- $row; USERNAME=$1; P=$2
+        echo "=== pass 1: $P (Cloud Build API + provisioner SA)"
+        SA="bootkon-provisioner@${P}.iam.gserviceaccount.com"
+        if ! gcloud services enable cloudbuild.googleapis.com --project="$P"; then
+            echo -e "${RED}$P: enabling Cloud Build failed -- skipping this project.${NC}" >&2
+            SKIP+=("$P"); continue
+        fi
+        if ! gcloud iam service-accounts describe "$SA" --project="$P" >/dev/null 2>&1; then
+            gcloud iam service-accounts create bootkon-provisioner --project="$P" \
+                --display-name="Bootkon prep (runs the Cloud Build prep)" \
+                || { echo -e "${RED}$P: creating the provisioner SA failed -- skipping.${NC}" >&2; SKIP+=("$P"); continue; }
+        fi
+        # A freshly created SA can take seconds to become visible to IAM --
+        # granting against it too early fails with "service account ... does
+        # not exist" (seen live). Retry instead of failing the project.
+        granted=""
+        for _try in 1 2 3 4 5 6; do
+            if gcloud projects add-iam-policy-binding "$P" \
+                --member="serviceAccount:$SA" --role="roles/owner" --condition=None >/dev/null 2>&1; then
+                granted=1
+                break
+            fi
+            sleep 5
+        done
+        [ -z "$granted" ] && { echo -e "${RED}$P: granting owner to the provisioner SA failed -- skipping.${NC}" >&2; SKIP+=("$P"); continue; }
+        # Submitting a build that runs as a custom SA requires actAs on it.
+        # Owner-ish organizer identities have that; a devstar (editor +
+        # projectIamAdmin) does not -- but CAN self-grant the project-level
+        # serviceAccountUser role, which covers actAs on the provisioner SA.
+        CALLER="$(gcloud config get-value account 2>/dev/null)"
+        [ -n "$CALLER" ] && gcloud projects add-iam-policy-binding "$P" \
+            --member="user:$CALLER" --role="roles/iam.serviceAccountUser" --condition=None >/dev/null \
+            || echo "NOTE: could not grant serviceAccountUser to $CALLER on $P (fine for owner identities)."
+    done
+    echo ""
+
+    # With only a handful of rows, seconds pass between the grants above and
+    # the submits below -- give IAM a moment; big CSVs age the grants through
+    # sheer loop length.
+    if [ ${#ROWS[@]} -le 3 ]; then
+        echo "Letting the IAM grants propagate (30s) ..."
+        sleep 30
+    fi
+
+    # Pass 2: one async build per project; the submit uploads the checkout as
+    # source (respecting .gitignore) and returns immediately. No watch: the
+    # builds run server-side, and bk-verify-fleet is the progress/readiness
+    # view.
+    BUILDS=()
+    SUBMIT_FAILED=()
+    for row in "${ROWS[@]}"; do
+        set -- $row; USERNAME=$1; P=$2
+        case " ${SKIP[*]-} " in *" $P "*) continue ;; esac
+        # A build already running against this project means someone (or a
+        # previous invocation) is mid-prep -- a double submit would only end
+        # in the second build backing off on the state lock. Skip it.
+        if [ -n "$(gcloud builds list --project="$P" \
+            --filter='status=WORKING OR status=QUEUED' --format='value(id)' --limit=1 2>/dev/null)" ]; then
+            echo "$P: a build is already running -- skipping (watch it with bk-verify-fleet)."
+            continue
+        fi
+        echo "=== pass 2: $P (submitting the build)"
+        id=$(gcloud builds submit --project="$P" --async --quiet \
+            --config="$REPO_ROOT/content/agenticdata/provisioning/cloudbuild.yaml" \
+            --substitutions=_USERNAME="$USERNAME" \
+            --format='value(id)' "$REPO_ROOT") \
+            && BUILDS+=("$P:$id") \
+            || { echo -e "${RED}$P: build submit failed.${NC}" >&2; SUBMIT_FAILED+=("$P"); }
+    done
+    echo ""
+
+    if [ ${#BUILDS[@]} -gt 0 ]; then
+        echo -e "${GREEN}Provisioning is now running inside the ${#BUILDS[@]} participant project(s)${NC}"
+        echo "(15-25 minutes each, fully server-side -- this terminal is done)."
+        echo "Watch progress and check readiness any time with:"
+        echo ""
+        if [ -n "$PROJECT_ID_PREFIX" ]; then
+            echo "  $SCRIPT_DIR/bk-verify-fleet \"$LOCAL_CSV_FILE\" \"$PROJECT_ID_PREFIX\""
+        else
+            echo "  $SCRIPT_DIR/bk-verify-fleet \"$LOCAL_CSV_FILE\""
+        fi
+        echo ""
+        echo "(raw build status: gcloud builds list --project=<project>)"
+    fi
+    if [ ${#SKIP[@]} -gt 0 ] || [ ${#SUBMIT_FAILED[@]} -gt 0 ]; then
+        [ ${#SKIP[@]} -gt 0 ] && echo -e "${RED}Skipped in pass 1: ${SKIP[*]}${NC}" >&2
+        [ ${#SUBMIT_FAILED[@]} -gt 0 ] && echo -e "${RED}Submit failed: ${SUBMIT_FAILED[*]}${NC}" >&2
+        echo -e "${RED}Fix the causes and rerun with --cloud-build (safe to repeat).${NC}" >&2
+        exit 1
+    fi
+    exit 0
+fi
+
+# Local mode runs terraform right here -- make sure it exists ONCE, up
+# front, instead of eight parallel workers racing the self-install. (The
+# cloud-build mode above never reaches this: terraform runs inside the
+# builds there.)
+. "$SCRIPT_DIR/ensure-terraform" || exit 1
+
+echo "Preparing ${#ROWS[@]} agenticdata project(s), up to $PARALLEL in parallel."
+echo "Per-project logs: $LOG_DIR"
+echo ""
+
+run_one() {
+    local username="$1" project="$2"
+
+    # Isolate gcloud configuration per parallel worker to prevent mTLS / Context-Aware
+    # Access certificate collisions (caa_cert.pem race condition) on corp machines.
+    local src_config="${CLOUDSDK_CONFIG:-$HOME/.config/gcloud}"
+    local gcloud_dir
+    gcloud_dir="$(mktemp -d "${TMPDIR:-/tmp}/bk-gcloud.XXXXXX")"
+    trap 'rm -rf "$gcloud_dir"' EXIT
+    if [ -d "$src_config" ]; then
+        for f in "$src_config"/*; do
+            [ -e "$f" ] || continue
+            local b="${f##*/}"
+            case "$b" in
+                caa_cert.pem|logs) continue ;;
+                *) ln -s "$f" "$gcloud_dir/$b" 2>/dev/null || true ;;
+            esac
+        done
+    fi
+    export CLOUDSDK_CONFIG="$gcloud_dir"
+
+    if "$PREP" "$project" "$username" >"$LOG_DIR/$project.log" 2>&1; then
+        echo -e "${GREEN}$project prepared${NC} ($username)"
+    else
+        touch "$LOG_DIR/$project.failed"
+        echo -e "${RED}$project FAILED${NC} ($username) -- log: $LOG_DIR/$project.log"
+        return 1
+    fi
+}
+export -f run_one
+export PREP LOG_DIR RED GREEN NC
+
+# First project alone: warms the shared Terraform plugin cache, so the
+# parallel wave below does not race the provider download.
+set -- ${ROWS[0]}
+run_one "$1" "$2"
+if [ ${#ROWS[@]} -gt 1 ]; then
+    printf '%s\n' "${ROWS[@]:1}" | xargs -P "$PARALLEL" -L1 bash -c 'run_one "$@"' _
+fi
+
+echo ""
+FAILED=("$LOG_DIR"/*.failed)
+if [ ! -e "${FAILED[0]}" ]; then
+    echo "All projects prepared."
+else
+    names=()
+    for f in "${FAILED[@]}"; do
+        f="$(basename "$f")"
+        names+=("${f%.failed}")
+    done
+    echo -e "${RED}${#names[@]} project(s) had errors: ${names[*]}${NC}" >&2
+    echo -e "${RED}Check the logs in $LOG_DIR, fix the causes, and rerun this script (safe to repeat).${NC}" >&2
+    exit 1
+fi
