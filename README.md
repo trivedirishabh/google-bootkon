@@ -157,13 +157,3 @@ And copy & paste the following command and press return:
 ```bash
 BK_STREAM=agenticdata BK_REPO=GoogleCloudPlatform/bootkon; . <(curl -fsSL https://raw.githubusercontent.com/${BK_REPO}/main/.scripts/bk)
 ```
-
-Now, please go back to Cloud Shell and continue with the tutorial that has been opened on the right hand side of your screen!
-
-
-## Authors
-
-The authors of Agentic Data Bootkon are:
-- [Fabian Hirschmann](https://www.linkedin.com/in/fhirschmann/) (maintainer; main author)
-- [Florian Baumert](https://www.linkedin.com/in/florian-baumert/)
-- [Cary Edwards](https://www.linkedin.com/in/cary-edwards-a3a557a6/)
